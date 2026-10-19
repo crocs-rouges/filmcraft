@@ -61,6 +61,7 @@ pub mod source_playback;
 pub mod state;
 pub mod theme;
 mod theme_favorites;
+pub mod transcription_bg;
 pub mod widgets;
 
 use std::collections::HashMap;
@@ -392,6 +393,8 @@ pub struct FilmcraftApp {
     pub workspaces: dock::WorkspacePrefs,
     /// Workspace names and the current one, as last handed to the native menu.
     menu_workspaces: (Vec<String>, String),
+    /// Background transcription job running faster-whisper.
+    pub transcription_job: Option<transcription_bg::TranscriptionJob>,
 }
 
 pub struct GpuState {
@@ -611,6 +614,7 @@ impl FilmcraftApp {
             workspace_restored: false,
             workspaces,
             menu_workspaces: Default::default(),
+            transcription_job: None,
         }
     }
 
@@ -2108,6 +2112,8 @@ impl eframe::App for FilmcraftApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // a native file dialog's answer first, so the panels draw what it chose (#260)
         self.poll_native_dialog(ctx);
+        // poll background transcription results
+        transcription_bg::poll_transcription(self, ctx);
         if !self.styled {
             theme::install(ctx, &self.tokens);
             // theme::install replaces the fonts: add the system Japanese font back (or fall back to

@@ -528,13 +528,33 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let words = &content.words;
     if words.is_empty() {
         let c = rect.center();
+
+        if let Some(job) = &app.transcription_job {
+            let t_sec = ui.input(|i| i.time);
+            let dots = match (t_sec * 2.5) as usize % 4 {
+                0 => "",
+                1 => ".",
+                2 => "..",
+                _ => "...",
+            };
+            let elapsed = job.start_time.elapsed().as_secs();
+            icons::paint(ui.painter(), Rect::from_center_size(c - vec2(0.0, 70.0), vec2(40.0, 40.0)), Icon::Mic, t.accent);
+            ui.painter().text(c - vec2(0.0, 30.0), Align2::CENTER_CENTER, format!("Transcription en cours avec faster-whisper{dots}"), Tokens::semibold(16.0), t.accent);
+            ui.painter().text(c - vec2(0.0, 8.0), Align2::CENTER_CENTER, format!("Traitement audio ({elapsed}s écoulées) · FilmCraft reste 100% fluide"), Tokens::ui(12.0), t.text_dim);
+
+            let r = Rect::from_center_size(c + vec2(0.0, 26.0), vec2(140.0, 26.0));
+            let resp = ui.interact(r, egui::Id::new("text.transcript.cancel"), Sense::click());
+            ui.painter().rect_filled(r, 13.0, if resp.hovered() { t.hover } else { t.field_bg });
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, "Annuler", Tokens::semibold(12.0), t.text);
+            if resp.clicked() {
+                crate::transcription_bg::cancel_transcription(app);
+            }
+            return;
+        }
+
         icons::paint(ui.painter(), Rect::from_center_size(c - vec2(0.0, 70.0), vec2(40.0, 40.0)), Icon::Captions, t.text_dim);
         ui.painter().text(c - vec2(0.0, 30.0), Align2::CENTER_CENTER, tl!("Transcribe sequence"), Tokens::semibold(16.0), t.text);
-        let note = if filmcraft_speech_available(app) {
-            tl!("Speech-to-text turns the dialogue into editable text.")
-        } else {
-            tl!("This build has no speech-to-text; import a transcript with transcript.set.")
-        };
+        let note = "La transcription IA (faster-whisper) convertit les voix en texte éditable.";
         ui.painter().text(c - vec2(0.0, 8.0), Align2::CENTER_CENTER, note, Tokens::ui(12.0), t.text_dim);
         let r = Rect::from_center_size(c + vec2(0.0, 26.0), vec2(200.0, 26.0));
         let resp = ui.interact(r, egui::Id::new("text.transcript.generate"), Sense::click());
@@ -542,7 +562,7 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         ui.painter().text(r.center(), Align2::CENTER_CENTER, tl!("Transcribe"), Tokens::semibold(12.0), Color32::WHITE);
         app.auto.add("text.transcript.generate", r, "Transcribe");
         if resp.clicked() {
-            actions.push(("transcript.generate".into(), json!({})));
+            actions.push(("transcript.generate".into(), json!({"force": true, "language": "fr"})));
         }
         run(app, ui, actions);
         return;
@@ -550,20 +570,24 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let sel = app.ui.transcript_sel.filter(|(a, b)| *a < words.len() && *b < words.len());
     let (sa, sb) = sel.map(|(a, b)| (a.min(b), a.max(b))).unzip();
 
-    // ---- toolbar: search, extract / lift selection, remove fillers / pauses, captions
+    // ---- toolbar: search, extract / lift selection, remove fillers / pauses, captions, retranscribe, delete
     let bar = Rect::from_min_size(rect.min + vec2(10.0, 2.0), vec2(rect.width() - 20.0, 26.0));
-    let sw = 170.0f32.min(bar.width() * 0.4);
+    let sw = 140.0f32.min(bar.width() * 0.35);
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(bar.min, vec2(sw, 24.0))));
     let sresp = crate::widgets::search_field(&mut child, &mut app.ui.transcript_search, tl!("Search"), sw, &t);
     app.auto.add("text.transcript.search", sresp.rect, "Search transcript");
     let highlights = app.transcript_cache.highlights(&app.ui.transcript_search);
-    let mut x = bar.min.x + sw + 10.0;
+    let mut x = bar.min.x + sw + 8.0;
     let range = sel.map(|(a, b)| json!({"from": a.min(b), "to": a.max(b)}));
-    let tools: [(Icon, &str, &str, bool, &str, Value); 4] = [
+
+    let is_busy = app.transcription_job.is_some();
+    let tools: [(Icon, &str, &str, bool, &str, Value); 6] = [
         (Icon::Razor, "text.transcript.extract", tl!("Extract selected text"), sel.is_some(), "transcript.extract", range.clone().unwrap_or_default()),
-        (Icon::Trash, "text.transcript.lift", tl!("Lift selected text"), sel.is_some(), "transcript.lift", range.unwrap_or_default()),
+        (Icon::Lift, "text.transcript.lift", tl!("Lift selected text"), sel.is_some(), "transcript.lift", range.unwrap_or_default()),
         (Icon::Link, "text.transcript.removeFillers", tl!("Remove filler words"), true, "transcript.removeFillers", json!({})),
         (Icon::Captions, "text.transcript.createCaptions", tl!("Create captions"), true, "transcript.createCaptions", json!({})),
+        (Icon::Mic, "text.transcript.retranscribe", "Re-transcrire avec faster-whisper", !is_busy, "transcript.generate", json!({"force": true, "language": "fr"})),
+        (Icon::Trash, "text.transcript.delete", "Supprimer la transcription de la séquence", !is_busy, "transcript.delete", json!({})),
     ];
     for (icon, id, label, enabled, cmd, params) in tools {
         let r = Rect::from_min_size(pos2(x, bar.min.y), vec2(24.0, 24.0));
@@ -571,7 +595,7 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             break;
         }
         if tool_button(app, ui, r, icon, id, label, enabled) {
-            if cmd.ends_with("extract") || cmd.ends_with("lift") {
+            if cmd.ends_with("extract") || cmd.ends_with("lift") || cmd.ends_with("delete") {
                 app.ui.transcript_sel = None;
             }
             actions.push((cmd.into(), params));
@@ -579,8 +603,31 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         x += 28.0;
     }
 
+    // ---- banner if transcription is running in background while words are displayed
+    let mut list_min_y = bar.max.y + 8.0;
+    if let Some(job) = &app.transcription_job {
+        let elapsed = job.start_time.elapsed().as_secs();
+        let banner_rect = Rect::from_min_size(pos2(rect.min.x + 6.0, list_min_y), vec2(rect.width() - 12.0, 26.0));
+        ui.painter().rect_filled(banner_rect, 3.0, t.field_bg);
+        ui.painter().text(
+            pos2(banner_rect.min.x + 8.0, banner_rect.center().y),
+            Align2::LEFT_CENTER,
+            format!("⏳ Re-transcription faster-whisper en cours... ({}s écoulées)", elapsed),
+            Tokens::semibold(11.5),
+            t.accent,
+        );
+        let cancel_r = Rect::from_min_size(pos2(banner_rect.max.x - 70.0, banner_rect.min.y + 3.0), vec2(62.0, 20.0));
+        let cresp = ui.interact(cancel_r, egui::Id::new("text.transcript.cancel_banner"), Sense::click());
+        ui.painter().rect_filled(cancel_r, 3.0, if cresp.hovered() { t.hover } else { t.app_bg });
+        ui.painter().text(cancel_r.center(), Align2::CENTER_CENTER, "Annuler", Tokens::ui(11.0), t.text);
+        if cresp.clicked() {
+            crate::transcription_bg::cancel_transcription(app);
+        }
+        list_min_y += 30.0;
+    }
+
     // ---- paragraphs of words
-    let list = Rect::from_min_max(pos2(rect.min.x + 6.0, bar.max.y + 8.0), pos2(rect.max.x - 6.0, rect.max.y - 4.0));
+    let list = Rect::from_min_max(pos2(rect.min.x + 6.0, list_min_y), pos2(rect.max.x - 6.0, rect.max.y - 4.0));
     ui.painter().rect_filled(list, 3.0, t.app_bg);
     let ph = app.session.playhead();
     let current = filmcraft_edit::transcript::word_at(words, ph);
@@ -624,10 +671,6 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
     });
     run(app, ui, actions);
-}
-
-fn filmcraft_speech_available(app: &FilmcraftApp) -> bool {
-    app.session.transcriber.is_some() || filmcraft_engine::transcript::speech_available()
 }
 
 fn style_strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, track_idx: usize, actions: &mut Vec<(String, Value)>) {

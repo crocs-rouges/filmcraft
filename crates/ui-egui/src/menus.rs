@@ -529,6 +529,16 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params:
             }
             return r;
         }
+        "transcript.generate" | "sequence.transcribe" => {
+            crate::transcription_bg::start_transcription(app, &params)?;
+            return Ok(json!({"status": "started"}));
+        }
+        "transcript.delete" => {
+            let r = app.session.execute("transcript.delete", params).map_err(|e| e.to_string())?;
+            app.ui.transcript_sel = None;
+            app.ui.status = "Transcription supprimée.".into();
+            return Ok(r);
+        }
         // From menus/shortcuts (no params) these ask first; agents pass params to act directly.
         "file.revert" if params.as_object().is_none_or(|m| m.is_empty()) && app.session.is_dirty() => {
             if app.session.path.is_none() {

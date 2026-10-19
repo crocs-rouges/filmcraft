@@ -94,8 +94,43 @@ fn selected_clip(app: &FilmcraftApp) -> Option<(ClipId, TrackItem, TrackKind)> {
     selected_clips(app).into_iter().next()
 }
 
+pub(crate) fn all_selected_video_clips(app: &FilmcraftApp) -> Vec<ClipId> {
+    let Some(seq) = app.session.active_sequence() else { return Vec::new() };
+    app.session
+        .state
+        .selection
+        .iter()
+        .filter_map(|c| {
+            let (tid, _) = seq.find_item(*c)?;
+            if seq.track(tid)?.kind == TrackKind::Video {
+                Some(*c)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn all_selected_audio_clips(app: &FilmcraftApp) -> Vec<ClipId> {
+    let Some(seq) = app.session.active_sequence() else { return Vec::new() };
+    app.session
+        .state
+        .selection
+        .iter()
+        .filter_map(|c| {
+            let (tid, _) = seq.find_item(*c)?;
+            if seq.track(tid)?.kind == TrackKind::Audio {
+                Some(*c)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// The selected clip (video first) and the audio linked to it when that audio is selected or
 /// linked selection is on — so clip audio FX (Parametric EQ, Custom Setup) stay visible on A/V pairs.
+/// When multiple clips are selected, prioritizes the clip under the playhead so the inspector matches the monitor.
 fn selected_clips(app: &FilmcraftApp) -> Vec<(ClipId, TrackItem, TrackKind)> {
     let Some(seq) = app.session.active_sequence() else { return Vec::new() };
     let picked: Vec<(ClipId, &TrackItem, TrackKind)> = app
@@ -108,7 +143,16 @@ fn selected_clips(app: &FilmcraftApp) -> Vec<(ClipId, TrackItem, TrackKind)> {
             Some((*c, it, seq.track(tid)?.kind))
         })
         .collect();
-    let Some(&(clip, it, kind)) = picked.iter().find(|p| p.2 == TrackKind::Video).or(picked.first()) else { return Vec::new() };
+    let ph = app.session.playhead();
+    let Some(&(clip, it, kind)) = picked
+        .iter()
+        .find(|p| p.2 == TrackKind::Video && p.1.start <= ph && ph < p.1.end())
+        .or_else(|| picked.iter().find(|p| p.2 == TrackKind::Video))
+        .or_else(|| picked.iter().find(|p| p.1.start <= ph && ph < p.1.end()))
+        .or(picked.first())
+    else {
+        return Vec::new();
+    };
     let mut out = vec![(clip, it.clone(), kind)];
     if kind == TrackKind::Video {
         let linked = picked.iter().find(|p| p.2 == TrackKind::Audio && p.1.link.is_some() && p.1.link == it.link).copied().or_else(|| {
@@ -678,7 +722,12 @@ pub(crate) fn param_row(
         }
     }
     if let Some(v) = set {
-        actions.push(("effects.setParam".into(), with_mask(json!({"clip": clip.0, "effect": idx, "param": pd.id, "value": v}))));
+        let is_video = app.session.active_sequence().and_then(|q| q.find_item(clip)).and_then(|(tid, _)| app.session.active_sequence()?.track(tid)).is_some_and(|t| t.kind == TrackKind::Video);
+        let sel = if is_video { all_selected_video_clips(app) } else { all_selected_audio_clips(app) };
+        let targets = if mask.is_none() && sel.contains(&clip) && sel.len() > 1 { sel } else { vec![clip] };
+        for target in targets {
+            actions.push(("effects.setParam".into(), with_mask(json!({"clip": target.0, "effect": idx, "param": pd.id, "value": v.clone()}))));
+        }
     }
     // keyframe navigator ◀ ◆ ▶ (when animated)
     let eff_json = json!(idx);
@@ -697,7 +746,12 @@ pub(crate) fn param_row(
         icons::paint(ui.painter(), rr, Icon::Reset, if rresp.hovered() { t.text } else { t.text_dim });
         app.auto.add(&format!("effectControls.{}.{}.reset", e.effect, pkey), rr, "Reset Parameter");
         if rresp.clicked() {
-            actions.push(("effects.resetParam".into(), json!({"clip": clip.0, "effect": eff_json, "param": pd.id})));
+            let is_video = app.session.active_sequence().and_then(|q| q.find_item(clip)).and_then(|(tid, _)| app.session.active_sequence()?.track(tid)).is_some_and(|t| t.kind == TrackKind::Video);
+            let sel = if is_video { all_selected_video_clips(app) } else { all_selected_audio_clips(app) };
+            let targets = if sel.contains(&clip) && sel.len() > 1 { sel } else { vec![clip] };
+            for target in targets {
+                actions.push(("effects.resetParam".into(), json!({"clip": target.0, "effect": eff_json, "param": pd.id})));
+            }
         }
     }
     // keyframes in the lane: draggable diamonds; right-click for interpolation
@@ -847,6 +901,9 @@ pub fn properties_panel(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         crate::dock::placeholder(ui, rect, &t, tl!("Select a clip to see its properties"));
         return;
     };
+    let sel_v = all_selected_video_clips(app);
+    let sel_a = all_selected_audio_clips(app);
+    let v_targets = if sel_v.contains(&clip) && sel_v.len() > 1 { sel_v.clone() } else { vec![clip] };
     let ph = app.session.playhead();
     let mt = it.source_time_at(ph.clamp(it.start, it.end() - Tick(1)));
     let mut actions: Vec<(String, Value)> = Vec::new();
@@ -856,13 +913,20 @@ pub fn properties_panel(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let sw = Rect::from_center_size(pos2(hr.min.x + 8.0, hr.center().y), vec2(12.0, 12.0));
     let lc = app.session.prefs.labels.rgb(it.label);
     bui.painter().rect_filled(sw, 2.0, Color32::from_rgb(lc[0], lc[1], lc[2]));
-    bui.painter().text(pos2(hr.min.x + 22.0, hr.center().y), Align2::LEFT_CENTER, &it.name, Tokens::semibold(12.5), t.text);
+    let header_label = if kind == TrackKind::Video && sel_v.len() > 1 {
+        format!("{} clips sélectionnés ({})", sel_v.len(), it.name)
+    } else if kind == TrackKind::Audio && sel_a.len() > 1 {
+        format!("{} clips audio sélectionnés ({})", sel_a.len(), it.name)
+    } else {
+        it.name.clone()
+    };
+    bui.painter().text(pos2(hr.min.x + 22.0, hr.center().y), Align2::LEFT_CENTER, &header_label, Tokens::semibold(12.5), t.text);
     let row = |ui: &mut egui::Ui, label: &str| -> Rect {
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
         ui.painter().text(pos2(r.min.x + 18.0, r.center().y), Align2::LEFT_CENTER, label, Tokens::ui(12.0), t.text_dim);
         r
     };
-    let section = |ui: &mut egui::Ui, app: &mut FilmcraftApp, name: &str, reset: Option<(usize, u64)>, actions: &mut Vec<(String, Value)>| -> bool {
+    let section = |ui: &mut egui::Ui, app: &mut FilmcraftApp, name: &str, reset: Option<(usize, Vec<ClipId>)>, actions: &mut Vec<(String, Value)>| -> bool {
         ui.add_space(4.0);
         let key = format!("props:{name}");
         let open = !app.ui.collapsed_fx.contains(&key);
@@ -875,11 +939,14 @@ pub fn properties_panel(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             t.text_dim,
         );
         ui.painter().text(pos2(r.min.x + 18.0, r.center().y), Align2::LEFT_CENTER, crate::i18n::t(name), Tokens::semibold(13.0), t.text);
-        if let Some((idx, c)) = reset {
+        if let Some((idx, ref targets)) = reset {
             let rr = Rect::from_center_size(pos2(r.max.x - PROPS_NAV_X, r.center().y), vec2(14.0, 14.0));
             icons::paint(ui.painter(), rr, Icon::Reset, t.text_dim);
-            if ui.interact(rr, egui::Id::new(("props-reset", name, c)), Sense::click()).clicked() {
-                actions.push(("effects.reset".into(), json!({"clip": c, "index": idx})));
+            let first_id = targets.first().map(|c| c.0).unwrap_or(0);
+            if ui.interact(rr, egui::Id::new(("props-reset", name, first_id)), Sense::click()).clicked() {
+                for c in targets {
+                    actions.push(("effects.reset".into(), json!({"clip": c.0, "index": idx})));
+                }
             }
         }
         if resp.clicked() {
@@ -898,7 +965,7 @@ pub fn properties_panel(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let eff_idx = |id: &str| it.effects.iter().position(|e| e.effect == id);
         let val = |eid: &str, p: &str| it.effect(eid).and_then(|e| e.param(p)).map(|p| p.value_at(mt));
         if kind == TrackKind::Video {
-            if section(bui, app, "Transform", eff_idx("motion").map(|i| (i, clip.0)), &mut actions) {
+            if section(bui, app, "Transform", eff_idx("motion").map(|i| (i, v_targets.clone())), &mut actions) {
                 for (label, p, unit, speed, range) in [
                     (tl!("Position"), "position", "", 1.0, (-100_000.0, 100_000.0)),
                     (tl!("Anchor point"), "anchor", "", 1.0, (-100_000.0, 100_000.0)),
@@ -917,10 +984,13 @@ pub fn properties_panel(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             vui.add_space(10.0);
                             let (_, ny) = crate::widgets::hot_number(&mut vui, egui::Id::new(("pp", p, "y", clip.0)), v.y, speed, range, 0, " Y", &t);
                             if nx.is_some() || ny.is_some() {
-                                actions.push((
-                                    "effects.setParam".into(),
-                                    json!({"clip": clip.0, "effect": "motion", "param": p, "value": [nx.unwrap_or(v.x), ny.unwrap_or(v.y)]}),
-                                ));
+                                let val_json = json!([nx.unwrap_or(v.x), ny.unwrap_or(v.y)]);
+                                for target in &v_targets {
+                                    actions.push((
+                                        "effects.setParam".into(),
+                                        json!({"clip": target.0, "effect": "motion", "param": p, "value": val_json}),
+                                    ));
+                                }
                             }
                         }
                         Some(ParamValue::Float(v)) => {
@@ -935,7 +1005,9 @@ pub fn properties_panel(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                                 &t,
                             );
                             if let Some(nv) = nv {
-                                actions.push(("effects.setParam".into(), json!({"clip": clip.0, "effect": "motion", "param": p, "value": nv})));
+                                for target in &v_targets {
+                                    actions.push(("effects.setParam".into(), json!({"clip": target.0, "effect": "motion", "param": p, "value": nv})));
+                                }
                             }
                         }
                         _ => {}
@@ -951,13 +1023,15 @@ pub fn properties_panel(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if let Some(ParamValue::Float(v)) = val("opacity", "opacity") {
                     let (_, nv) = crate::widgets::hot_number(&mut vui, egui::Id::new(("pp-op", clip.0)), v, 0.5, (0.0, 100.0), 0, " %", &t);
                     if let Some(nv) = nv {
-                        actions.push(("effects.setParam".into(), json!({"clip": clip.0, "effect": "opacity", "param": "opacity", "value": nv})));
+                        for target in &v_targets {
+                            actions.push(("effects.setParam".into(), json!({"clip": target.0, "effect": "opacity", "param": "opacity", "value": nv})));
+                        }
                     }
                 }
                 properties_nav(app, bui, r, clip, &it, mt, "opacity", "opacity", &mut actions);
             }
             let crop = eff_idx("crop");
-            if section(bui, app, "Crop", crop.map(|i| (i, clip.0)), &mut actions) {
+            if section(bui, app, "Crop", crop.map(|i| (i, v_targets.clone())), &mut actions) {
                 for (label, p) in [(tl!("Left"), "left"), (tl!("Top"), "top"), (tl!("Right"), "right"), (tl!("Bottom"), "bottom")] {
                     let r = row(bui, label);
                     let mut vui = bui.new_child(
@@ -968,43 +1042,51 @@ pub fn properties_panel(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let v = val("crop", p).and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let (_, nv) = crate::widgets::hot_number(&mut vui, egui::Id::new(("pp-crop", p, clip.0)), v, 0.2, (0.0, 100.0), 1, " %", &t);
                     if let Some(nv) = nv {
-                        if crop.is_none() {
-                            actions.push(("effects.apply".into(), json!({"clips": [clip.0], "effect": "crop"})));
+                        for target in &v_targets {
+                            let needs_crop = app.session.active_sequence().and_then(|q| q.find_item(*target)).map_or(false, |(_, item)| item.effect("crop").is_none());
+                            if needs_crop {
+                                actions.push(("effects.apply".into(), json!({"clips": [target.0], "effect": "crop"})));
+                            }
+                            actions.push(("effects.setParam".into(), json!({"clip": target.0, "effect": "crop", "param": p, "value": nv})));
                         }
-                        actions.push(("effects.setParam".into(), json!({"clip": clip.0, "effect": "crop", "param": p, "value": nv})));
                     }
                     properties_nav(app, bui, r, clip, &it, mt, "crop", p, &mut actions);
                 }
             }
         }
-        if let Some((clip, it, _)) = clips.iter().find(|c| c.2 == TrackKind::Audio)
-            && section(bui, app, "Audio", it.effects.iter().position(|e| e.effect == "volume").map(|i| (i, clip.0)), &mut actions)
-        {
-            let clip = *clip;
-            let mt = it.source_time_at(ph.clamp(it.start, (it.end() - Tick(1)).max(it.start)));
-            let val = |eid: &str, p: &str| it.effect(eid).and_then(|e| e.param(p)).map(|p| p.value_at(mt));
-            let r = row(bui, tl!("Level"));
-            let mut vui = bui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(Rect::from_min_max(pos2(r.min.x + 150.0, r.min.y + 4.0), pos2(r.max.x - PROPS_VALUE_R, r.max.y - 4.0)))
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            );
-            let v = val("volume", "level").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let (_, nv) = crate::widgets::hot_number(&mut vui, egui::Id::new(("pp-vol", clip.0)), v, 0.1, (-96.0, 15.0), 1, " dB", &t);
-            if let Some(nv) = nv {
-                actions.push(("effects.setParam".into(), json!({"clip": clip.0, "effect": "volume", "param": "level", "value": nv})));
-            }
-            properties_nav(app, bui, r, clip, it, mt, "volume", "level", &mut actions);
-            let r = row(bui, tl!("Pan"));
-            let mut vui = bui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(Rect::from_min_max(pos2(r.min.x + 150.0, r.min.y + 4.0), pos2(r.max.x - PROPS_VALUE_R, r.max.y - 4.0)))
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            );
-            let v = val("panner", "balance").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let (_, nv) = crate::widgets::hot_number(&mut vui, egui::Id::new(("pp-pan", clip.0)), v, 0.5, (-100.0, 100.0), 0, "", &t);
-            if let Some(nv) = nv {
-                actions.push(("effects.setParam".into(), json!({"clip": clip.0, "effect": "panner", "param": "balance", "value": nv})));
+        if let Some((aclip, ait, _)) = clips.iter().find(|c| c.2 == TrackKind::Audio) {
+            let a_targets = if sel_a.contains(aclip) && sel_a.len() > 1 { sel_a.clone() } else { vec![*aclip] };
+            if section(bui, app, "Audio", ait.effects.iter().position(|e| e.effect == "volume").map(|i| (i, a_targets.clone())), &mut actions) {
+                let aclip = *aclip;
+                let mt = ait.source_time_at(ph.clamp(ait.start, (ait.end() - Tick(1)).max(ait.start)));
+                let val = |eid: &str, p: &str| ait.effect(eid).and_then(|e| e.param(p)).map(|p| p.value_at(mt));
+                let r = row(bui, tl!("Level"));
+                let mut vui = bui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(Rect::from_min_max(pos2(r.min.x + 150.0, r.min.y + 4.0), pos2(r.max.x - PROPS_VALUE_R, r.max.y - 4.0)))
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                let v = val("volume", "level").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let (_, nv) = crate::widgets::hot_number(&mut vui, egui::Id::new(("pp-vol", aclip.0)), v, 0.1, (-96.0, 15.0), 1, " dB", &t);
+                if let Some(nv) = nv {
+                    for target in &a_targets {
+                        actions.push(("effects.setParam".into(), json!({"clip": target.0, "effect": "volume", "param": "level", "value": nv})));
+                    }
+                }
+                properties_nav(app, bui, r, aclip, ait, mt, "volume", "level", &mut actions);
+                let r = row(bui, tl!("Pan"));
+                let mut vui = bui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(Rect::from_min_max(pos2(r.min.x + 150.0, r.min.y + 4.0), pos2(r.max.x - PROPS_VALUE_R, r.max.y - 4.0)))
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                let v = val("panner", "balance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let (_, nv) = crate::widgets::hot_number(&mut vui, egui::Id::new(("pp-pan", aclip.0)), v, 0.5, (-100.0, 100.0), 0, "", &t);
+                if let Some(nv) = nv {
+                    for target in &a_targets {
+                        actions.push(("effects.setParam".into(), json!({"clip": target.0, "effect": "panner", "param": "balance", "value": nv})));
+                    }
+                }
             }
         }
         // speed footer

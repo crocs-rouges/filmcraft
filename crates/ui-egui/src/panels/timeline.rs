@@ -2205,6 +2205,7 @@ pub(crate) struct WheelInput {
     pub(crate) delta: egui::Vec2,
     /// Pinch factor (1 = none).
     pub(crate) pinch: f32,
+    pub(crate) ctrl: bool,
     command: bool,
     alt: bool,
     shift: bool,
@@ -2215,7 +2216,11 @@ pub(crate) struct WheelInput {
 /// meaning for both. The modifiers are those of the events (a script's wheel carries its own).
 pub(crate) fn wheel_input(ctx: &egui::Context) -> WheelInput {
     ctx.input(|i| {
-        let mut w = WheelInput { delta: egui::Vec2::ZERO, pinch: 1.0, command: false, alt: false, shift: false };
+        let mut w = WheelInput { delta: egui::Vec2::ZERO, pinch: 1.0, ctrl: false, command: false, alt: false, shift: false };
+        let ctx_zoom = i.zoom_delta();
+        if (ctx_zoom - 1.0).abs() > 1e-4 && ctx_zoom.is_finite() && ctx_zoom > 0.0 {
+            w.pinch *= ctx_zoom;
+        }
         for e in &i.events {
             match e {
                 egui::Event::MouseWheel { unit, delta, modifiers, .. } => {
@@ -2227,7 +2232,8 @@ pub(crate) fn wheel_input(ctx: &egui::Context) -> WheelInput {
                     if delta.x.is_finite() && delta.y.is_finite() {
                         w.delta += *delta * points;
                     }
-                    w.command |= modifiers.command || modifiers.mac_cmd || modifiers.ctrl;
+                    w.ctrl |= modifiers.ctrl;
+                    w.command |= modifiers.command || modifiers.mac_cmd;
                     w.alt |= modifiers.alt;
                     w.shift |= modifiers.shift;
                 }
@@ -2287,11 +2293,12 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
     //   Option + wheel   zoom about the pointer
     // Settings ▸ Timeline ▸ Timeline Mouse Scrolling "Horizontal" swaps the first two. A sideways
     // gesture (trackpad swipe, tilt wheel, Shift + wheel) always scrolls sideways; a pinch zooms.
+    // On Windows, Precision Touchpad pinch translates to Ctrl + wheel, which zooms about the pointer.
     if ui.rect_contains_pointer(rect)
         && let Some(p) = ctx.pointer_hover_pos()
     {
         let w = wheel_input(&ctx);
-        if (w.pinch - 1.0).abs() > 1e-4 || (w.alt && w.delta.y != 0.0) {
+        if (w.pinch - 1.0).abs() > 1e-4 || ((w.alt || w.ctrl) && w.delta.y != 0.0) {
             let f = if (w.pinch - 1.0).abs() > 1e-4 { w.pinch as f64 } else { (1.0_f64 + w.delta.y as f64 * 0.01).clamp(0.5, 2.0) };
             let anchor_t = layout.tick_at(p.x).seconds();
             let v = &mut app.ui.timeline;
